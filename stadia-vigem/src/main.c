@@ -27,6 +27,7 @@ struct active_device
     struct stadia_controller *controller;
     PVIGEM_TARGET tgt_device;
     XUSB_REPORT tgt_report;
+    DWORD prev_buttons;
 };
 
 static int active_device_count = 0;
@@ -67,6 +68,30 @@ SHORT FORCEINLINE _map_byte_to_short(BYTE value, BOOL inverted)
         centered = -centered;
     }
     return (SHORT)(32767 * centered / 127);
+}
+
+// Win+Print Screen: screenshot, saved to Pictures\Screenshots
+static const WORD screenshot_keys[] = {VK_LWIN, VK_SNAPSHOT};
+// Win+Alt+B: turn HDR on or off
+static const WORD hdr_toggle_keys[] = {VK_LWIN, VK_MENU, 'B'};
+
+// Sends a Windows keyboard shortcut: presses the keys in order, then releases them in reverse order
+static void send_shortcut(const WORD *keys, int count)
+{
+    INPUT inputs[8] = {0};
+    if (count > 4)
+    {
+        return;
+    }
+    for (int i = 0; i < count; i++)
+    {
+        inputs[i].type = INPUT_KEYBOARD;
+        inputs[i].ki.wVk = keys[i];
+        inputs[2 * count - 1 - i].type = INPUT_KEYBOARD;
+        inputs[2 * count - 1 - i].ki.wVk = keys[i];
+        inputs[2 * count - 1 - i].ki.dwFlags = KEYEVENTF_KEYUP;
+    }
+    SendInput(2 * count, inputs, sizeof(INPUT));
 }
 
 static void rebuild_tray_menu()
@@ -144,6 +169,7 @@ static BOOL add_device(LPTSTR path)
     struct active_device *active_device = (struct active_device *)malloc(sizeof(struct active_device));
     active_device->src_device = device;
     active_device->controller = controller;
+    active_device->prev_buttons = STADIA_BUTTON_NONE;
 
     if (vigem_connected)
     {
@@ -297,6 +323,18 @@ static void stadia_controller_update_cb(struct stadia_controller *controller, st
     if (active_device == NULL)
     {
         return;
+    }
+
+    // Capture and Assistant have no Xbox 360 counterpart: they send Windows shortcuts when pressed
+    DWORD pressed = state->buttons & ~active_device->prev_buttons;
+    active_device->prev_buttons = state->buttons;
+    if ((pressed & STADIA_BUTTON_CAPTURE) != 0)
+    {
+        send_shortcut(screenshot_keys, ARRAYSIZE(screenshot_keys));
+    }
+    if ((pressed & STADIA_BUTTON_ASSISTANT) != 0)
+    {
+        send_shortcut(hdr_toggle_keys, ARRAYSIZE(hdr_toggle_keys));
     }
 
     if (vigem_connected)
