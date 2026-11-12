@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param (
     [Parameter()][ValidateSet("DEBUG", "RELEASE")][string]$Configuration = "DEBUG",
-    [Parameter()][ValidateSet("x86", "x64")][string]$Architecture = "x86",
+    [Parameter()][ValidateSet("x86", "x64", "arm64")][string]$Architecture = "x86",
     [Parameter()][bool]$SkipBuildToolsSetup = $false
 )
 
@@ -142,6 +142,14 @@ if ($Architecture -eq "x64" -Or $Architecture -eq "ALL") {
     Invoke-Build-libstadia -Architecture "x64"
     #Invoke-Build-Stadia-Tester -Architecture "x64"
     Invoke-Build-Stadia-ViGEm -Architecture "x64"
+}
+
+if ($Architecture -eq "arm64" -Or $Architecture -eq "ALL") {
+    # Native tools on an ARM64 host, x64-hosted cross tools elsewhere
+    $HostArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    Invoke-BuildTools -Architecture $(if ($HostArchitecture -eq "Arm64") { "arm64" } else { "x64_arm64" })
+    Invoke-Build-libstadia -Architecture "arm64"
+    Invoke-Build-Stadia-ViGEm -Architecture "arm64"
 }
 
 Write-Host "-- Build completed. --"

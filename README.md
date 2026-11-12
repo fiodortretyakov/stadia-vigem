@@ -16,7 +16,7 @@ Stadia-ViGEm creates a virtual Xbox 360 controller which results in double input
  - Open HidHide Configuration Client
  - On Applications tab:
    - Click "+" button
-   - Browse to the Stadia-ViGEm executable you normally use (Stadia-ViGEm-x86.exe or Stadia-ViGEm-x64.exe)
+   - Browse to the Stadia-ViGEm executable you normally use (Stadia-ViGEm-x86.exe, Stadia-ViGEm-x64.exe or Stadia-ViGEm-arm64.exe)
  - On Devices tab:
    - Tick box next to the Stadia controller entry (wired controllers are named "Google LLC Stadia Controller rev. A" & bluetooth controllers are named "HID-compliant game controller")
    - Tick "Enable device hiding" at the bottom of the window
