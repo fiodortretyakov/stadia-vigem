@@ -70,28 +70,286 @@ SHORT FORCEINLINE _map_byte_to_short(BYTE value, BOOL inverted)
     return (SHORT)(32767 * centered / 127);
 }
 
-// Win+Print Screen: screenshot, saved to Pictures\Screenshots
-static const WORD screenshot_keys[] = {VK_LWIN, VK_SNAPSHOT};
-// Win+Alt+B: turn HDR on or off
-static const WORD hdr_toggle_keys[] = {VK_LWIN, VK_MENU, 'B'};
+/*
+ * Keyboard shortcuts for the Capture and Assistant buttons, which have no Xbox 360 counterpart.
+ *
+ * They come from stadia-vigem.ini next to the program, read on every press, so edits apply at once:
+ *
+ *   [Prey.exe]
+ *   Capture=F5
+ *   Assistant=F9, hold 1s
+ *
+ * The section named after the foreground program's exe wins over [default]; without either, the button does nothing.
+ * An empty value also means the button does nothing. ", hold 1s" (or ", hold 500ms") sends the keys only after the
+ * button has been held that long.
+ */
+#define SETTINGS_FILE_NAME TEXT("stadia-vigem.ini")
+#define SETTINGS_UNSET TEXT("<unset>")
+#define MAX_SHORTCUT_KEYS 4
+#define SHORTCUT_KEY_DOWN_MS 50
 
-// Sends a Windows keyboard shortcut: presses the keys in order, then releases them in reverse order
-static void send_shortcut(const WORD *keys, int count)
+enum extra_button
 {
-    INPUT inputs[8] = {0};
-    if (count > 4)
+    EXTRA_BUTTON_CAPTURE,
+    EXTRA_BUTTON_ASSISTANT,
+    EXTRA_BUTTON_COUNT
+};
+
+static const DWORD extra_button_masks[EXTRA_BUTTON_COUNT] = {STADIA_BUTTON_CAPTURE, STADIA_BUTTON_ASSISTANT};
+static const LPCTSTR extra_button_names[EXTRA_BUTTON_COUNT] = {TEXT("Capture"), TEXT("Assistant")};
+
+// Changes on every press and release, so a hold shortcut can tell whether the button is still down
+static volatile LONG extra_button_press_ids[EXTRA_BUTTON_COUNT];
+
+static TCHAR settings_path[MAX_PATH];
+
+struct shortcut
+{
+    WORD keys[MAX_SHORTCUT_KEYS];
+    int key_count;
+    DWORD hold_ms;
+};
+
+struct pending_shortcut
+{
+    struct shortcut shortcut;
+    int button;
+    LONG press_id;
+};
+
+static void trim(LPTSTR text)
+{
+    LPTSTR start = text;
+    while (*start == TEXT(' ') || *start == TEXT('\t'))
+    {
+        start++;
+    }
+    size_t length = _tcslen(start);
+    while (length > 0 && (start[length - 1] == TEXT(' ') || start[length - 1] == TEXT('\t')))
+    {
+        length--;
+    }
+    memmove(text, start, length * sizeof(TCHAR));
+    text[length] = TEXT('\0');
+}
+
+static WORD key_from_name(LPCTSTR name)
+{
+    static const struct
+    {
+        LPCTSTR name;
+        WORD vk;
+    } named_keys[] = {
+        {TEXT("Win"), VK_LWIN}, {TEXT("Ctrl"), VK_CONTROL}, {TEXT("Alt"), VK_MENU}, {TEXT("Shift"), VK_SHIFT},
+        {TEXT("Esc"), VK_ESCAPE}, {TEXT("Enter"), VK_RETURN}, {TEXT("Space"), VK_SPACE}, {TEXT("Tab"), VK_TAB},
+        {TEXT("Backspace"), VK_BACK}, {TEXT("Insert"), VK_INSERT}, {TEXT("Delete"), VK_DELETE},
+        {TEXT("Home"), VK_HOME}, {TEXT("End"), VK_END}, {TEXT("PageUp"), VK_PRIOR}, {TEXT("PageDown"), VK_NEXT},
+        {TEXT("Up"), VK_UP}, {TEXT("Down"), VK_DOWN}, {TEXT("Left"), VK_LEFT}, {TEXT("Right"), VK_RIGHT},
+        {TEXT("PrintScreen"), VK_SNAPSHOT}};
+
+    for (int i = 0; i < (int)ARRAYSIZE(named_keys); i++)
+    {
+        if (_tcsicmp(name, named_keys[i].name) == 0)
+        {
+            return named_keys[i].vk;
+        }
+    }
+    if ((name[0] == TEXT('F') || name[0] == TEXT('f')) && _istdigit(name[1]))
+    {
+        int number = _ttoi(name + 1);
+        return number >= 1 && number <= 24 ? (WORD)(VK_F1 + number - 1) : 0;
+    }
+    if (name[0] != TEXT('\0') && name[1] == TEXT('\0'))
+    {
+        TCHAR c = (TCHAR)_totupper(name[0]);
+        if ((c >= TEXT('A') && c <= TEXT('Z')) || (c >= TEXT('0') && c <= TEXT('9')))
+        {
+            return (WORD)c;
+        }
+    }
+    return 0;
+}
+
+// Parses "Ctrl+S" or "F9, hold 1s"; returns FALSE (and no keys) on anything it does not understand
+static BOOL parse_shortcut(LPTSTR text, struct shortcut *shortcut)
+{
+    memset(shortcut, 0, sizeof(*shortcut));
+
+    LPTSTR comment = _tcschr(text, TEXT(';'));
+    if (comment != NULL)
+    {
+        *comment = TEXT('\0');
+    }
+    LPTSTR option = _tcschr(text, TEXT(','));
+    if (option != NULL)
+    {
+        *option++ = TEXT('\0');
+        trim(option);
+        if (_tcsnicmp(option, TEXT("hold"), 4) != 0)
+        {
+            return FALSE;
+        }
+        LPTSTR unit = NULL;
+        double amount = _tcstod(option + 4, &unit);
+        trim(unit);
+        if (amount <= 0)
+        {
+            return FALSE;
+        }
+        if (_tcsicmp(unit, TEXT("s")) == 0)
+        {
+            amount *= 1000;
+        }
+        else if (_tcsicmp(unit, TEXT("ms")) != 0)
+        {
+            return FALSE;
+        }
+        if (amount > 10000)
+        {
+            return FALSE;
+        }
+        shortcut->hold_ms = (DWORD)amount;
+    }
+
+    trim(text);
+    LPTSTR context = NULL;
+    for (LPTSTR part = _tcstok_s(text, TEXT("+"), &context); part != NULL; part = _tcstok_s(NULL, TEXT("+"), &context))
+    {
+        trim(part);
+        WORD vk = key_from_name(part);
+        if (vk == 0 || shortcut->key_count == MAX_SHORTCUT_KEYS)
+        {
+            shortcut->key_count = 0;
+            return FALSE;
+        }
+        shortcut->keys[shortcut->key_count++] = vk;
+    }
+    return TRUE;
+}
+
+static void foreground_exe_name(LPTSTR name, DWORD size)
+{
+    name[0] = TEXT('\0');
+    DWORD pid = 0;
+    HWND window = GetForegroundWindow();
+    if (window == NULL || GetWindowThreadProcessId(window, &pid) == 0)
     {
         return;
     }
-    for (int i = 0; i < count; i++)
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == NULL)
     {
-        inputs[i].type = INPUT_KEYBOARD;
-        inputs[i].ki.wVk = keys[i];
-        inputs[2 * count - 1 - i].type = INPUT_KEYBOARD;
-        inputs[2 * count - 1 - i].ki.wVk = keys[i];
-        inputs[2 * count - 1 - i].ki.dwFlags = KEYEVENTF_KEYUP;
+        return;
     }
-    SendInput(2 * count, inputs, sizeof(INPUT));
+    TCHAR path[MAX_PATH];
+    DWORD length = MAX_PATH;
+    if (QueryFullProcessImageName(process, 0, path, &length))
+    {
+        LPTSTR base = _tcsrchr(path, TEXT('\\'));
+        lstrcpyn(name, base != NULL ? base + 1 : path, size);
+    }
+    CloseHandle(process);
+}
+
+static void lookup_shortcut(int button, struct shortcut *shortcut)
+{
+    TCHAR exe[MAX_PATH];
+    TCHAR value[128];
+
+    foreground_exe_name(exe, MAX_PATH);
+    value[0] = TEXT('\0');
+    if (exe[0] != TEXT('\0'))
+    {
+        GetPrivateProfileString(exe, extra_button_names[button], SETTINGS_UNSET, value, ARRAYSIZE(value), settings_path);
+    }
+    if (exe[0] == TEXT('\0') || _tcscmp(value, SETTINGS_UNSET) == 0)
+    {
+        GetPrivateProfileString(TEXT("default"), extra_button_names[button], TEXT(""), value, ARRAYSIZE(value),
+                                settings_path);
+    }
+    parse_shortcut(value, shortcut);
+}
+
+static void fill_key_input(INPUT *input, WORD vk, BOOL up)
+{
+    // Scan codes too, because games that read raw input or DirectInput ignore virtual-key-only events
+    UINT scan = MapVirtualKey(vk, MAPVK_VK_TO_VSC_EX);
+    input->type = INPUT_KEYBOARD;
+    input->ki.wVk = vk;
+    input->ki.wScan = (WORD)(scan & 0xFF);
+    input->ki.dwFlags = (scan != 0 ? KEYEVENTF_SCANCODE : 0) | ((scan & 0xFF00) == 0xE000 ? KEYEVENTF_EXTENDEDKEY : 0) |
+                        (up ? KEYEVENTF_KEYUP : 0);
+}
+
+// Presses the keys in order, holds them briefly so games that poll once per frame see them, releases in reverse order
+static void send_shortcut(const struct shortcut *shortcut)
+{
+    INPUT inputs[MAX_SHORTCUT_KEYS] = {0};
+
+    for (int i = 0; i < shortcut->key_count; i++)
+    {
+        fill_key_input(&inputs[i], shortcut->keys[i], FALSE);
+    }
+    SendInput(shortcut->key_count, inputs, sizeof(INPUT));
+    Sleep(SHORTCUT_KEY_DOWN_MS);
+    for (int i = 0; i < shortcut->key_count; i++)
+    {
+        fill_key_input(&inputs[i], shortcut->keys[shortcut->key_count - 1 - i], TRUE);
+    }
+    SendInput(shortcut->key_count, inputs, sizeof(INPUT));
+}
+
+static DWORD WINAPI shortcut_thread(LPVOID param)
+{
+    struct pending_shortcut *pending = (struct pending_shortcut *)param;
+
+    if (pending->shortcut.hold_ms > 0)
+    {
+        Sleep(pending->shortcut.hold_ms);
+    }
+    // A hold shortcut fires only if the button has not been released since this press
+    if (pending->shortcut.hold_ms == 0 || extra_button_press_ids[pending->button] == pending->press_id)
+    {
+        send_shortcut(&pending->shortcut);
+    }
+    free(pending);
+    return 0;
+}
+
+// Runs on the controller's input thread, so the key presses and holds happen on a thread of their own
+static void start_shortcut(int button)
+{
+    LONG press_id = InterlockedIncrement(&extra_button_press_ids[button]);
+    struct shortcut shortcut;
+
+    lookup_shortcut(button, &shortcut);
+    if (shortcut.key_count == 0)
+    {
+        return;
+    }
+    struct pending_shortcut *pending = (struct pending_shortcut *)malloc(sizeof(struct pending_shortcut));
+    pending->shortcut = shortcut;
+    pending->button = button;
+    pending->press_id = press_id;
+    HANDLE thread = CreateThread(NULL, 0, shortcut_thread, pending, 0, NULL);
+    if (thread == NULL)
+    {
+        free(pending);
+        return;
+    }
+    CloseHandle(thread);
+}
+
+static void init_settings_path()
+{
+    DWORD length = GetModuleFileName(NULL, settings_path, MAX_PATH);
+    LPTSTR base = length > 0 && length < MAX_PATH ? _tcsrchr(settings_path, TEXT('\\')) : NULL;
+    if (base == NULL || (size_t)(base + 1 - settings_path) + _tcslen(SETTINGS_FILE_NAME) >= MAX_PATH)
+    {
+        lstrcpyn(settings_path, SETTINGS_FILE_NAME, MAX_PATH);
+        return;
+    }
+    lstrcpyn(base + 1, SETTINGS_FILE_NAME, (int)(MAX_PATH - (base + 1 - settings_path)));
 }
 
 static void rebuild_tray_menu()
@@ -325,16 +583,20 @@ static void stadia_controller_update_cb(struct stadia_controller *controller, st
         return;
     }
 
-    // Capture and Assistant have no Xbox 360 counterpart: they send Windows shortcuts when pressed
+    // Capture and Assistant have no Xbox 360 counterpart: they send keyboard shortcuts (see stadia-vigem.ini)
     DWORD pressed = state->buttons & ~active_device->prev_buttons;
+    DWORD released = active_device->prev_buttons & ~state->buttons;
     active_device->prev_buttons = state->buttons;
-    if ((pressed & STADIA_BUTTON_CAPTURE) != 0)
+    for (int button = 0; button < EXTRA_BUTTON_COUNT; button++)
     {
-        send_shortcut(screenshot_keys, ARRAYSIZE(screenshot_keys));
-    }
-    if ((pressed & STADIA_BUTTON_ASSISTANT) != 0)
-    {
-        send_shortcut(hdr_toggle_keys, ARRAYSIZE(hdr_toggle_keys));
+        if ((released & extra_button_masks[button]) != 0)
+        {
+            InterlockedIncrement(&extra_button_press_ids[button]);
+        }
+        if ((pressed & extra_button_masks[button]) != 0)
+        {
+            start_shortcut(button);
+        }
     }
 
     if (vigem_connected)
@@ -398,6 +660,7 @@ static void quit_cb(struct tray_menu *item)
 
 INT main()
 {
+    init_settings_path();
     rebuild_tray_menu();
     if (tray_init(&tray) < 0)
     {

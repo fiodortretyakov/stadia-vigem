@@ -10,7 +10,9 @@ Xbox 360 controller emulation driver is provided by ViGEm (https://github.com/Vi
 ## How it works
 Stadia-ViGEm program at start scans for Stadia Controllers and then proxies found Stadia Controllers to virtual Xbox 360 gamepads (with help from ViGEmBus). Also Stadia-ViGEm subscribes to system device plug/unplug notifications and rescans for devices on each notification.
 All found devices are displayed in the tray icon context menu. Manual device rescan can be initiated via the tray icon context menu.
-The Capture button takes a Windows screenshot (Win+Print Screen), saved to Pictures\Screenshots. The Assistant button turns HDR on or off (Win+Alt+B, needs Xbox Game Bar).
+
+## Capture and Assistant buttons
+These two buttons have no Xbox 360 counterpart, so they send keyboard shortcuts instead, set per game in `stadia-vigem.ini` next to the executable (see [the example](stadia-vigem/stadia-vigem.ini)). The file is read on every press, so changes apply at once. The example maps quick save (Capture, F5) and quick load (Assistant held for 1 second, F9) in Prey. Without a matching section, both buttons do nothing.
 
 ## Double input
 Stadia-ViGEm creates a virtual Xbox 360 controller which results in double input issues when some applications will read input from both the virtual and the real Stadia controller. To avoid this, install [HidHide](https://github.com/ViGEm/HidHide) and configure it as follows:
