@@ -292,6 +292,7 @@ struct hid_device *hid_open_device(LPTSTR path, BOOL access_rw, BOOL shared)
     _tcscpy(dev->path, path);
     dev->handle = handle;
     dev->read_pending = FALSE;
+    dev->write_pending = FALSE;
     dev->input_report_size = caps.InputReportByteLength;
     dev->output_report_size = caps.OutputReportByteLength;
     dev->feature_report_size = caps.FeatureReportByteLength;
