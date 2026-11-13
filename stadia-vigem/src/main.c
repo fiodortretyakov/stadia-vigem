@@ -75,18 +75,26 @@ SHORT FORCEINLINE _map_byte_to_short(BYTE value, BOOL inverted)
  *
  * They come from stadia-vigem.ini next to the program, read on every press, so edits apply at once:
  *
+ *   [default]
+ *   Capture=Win+PrintScreen
+ *   CaptureHold=F9
+ *
  *   [Prey.exe]
  *   Capture=F5
  *   Assistant=F9, hold 1s
  *
- * The section named after the foreground program's exe wins over [default]; without either, the button does nothing.
- * An empty value also means the button does nothing. ", hold 1s" (or ", hold 500ms") sends the keys only after the
- * button has been held that long.
+ * A section named after the foreground program's exe replaces [default] completely; without either, the button does
+ * nothing. An empty value also means the button does nothing. ", hold 1s" (or ", hold 500ms") sends the keys only
+ * after the button has been held that long.
+ * <Button>Hold sets a second shortcut for holding the button (1 second unless it has its own ", hold"). With it, the
+ * plain shortcut is sent on a short press, at release, and the hold shortcut when the button is still down after
+ * the hold time; only one of the two is sent.
  */
 #define SETTINGS_FILE_NAME TEXT("stadia-vigem.ini")
-#define SETTINGS_UNSET TEXT("<unset>")
 #define MAX_SHORTCUT_KEYS 4
 #define SHORTCUT_KEY_DOWN_MS 50
+#define DEFAULT_HOLD_MS 1000
+#define HOLD_POLL_MS 10
 
 enum extra_button
 {
@@ -97,6 +105,7 @@ enum extra_button
 
 static const DWORD extra_button_masks[EXTRA_BUTTON_COUNT] = {STADIA_BUTTON_CAPTURE, STADIA_BUTTON_ASSISTANT};
 static const LPCTSTR extra_button_names[EXTRA_BUTTON_COUNT] = {TEXT("Capture"), TEXT("Assistant")};
+static const LPCTSTR extra_button_hold_names[EXTRA_BUTTON_COUNT] = {TEXT("CaptureHold"), TEXT("AssistantHold")};
 
 // Changes on every press and release, so a hold shortcut can tell whether the button is still down
 static volatile LONG extra_button_press_ids[EXTRA_BUTTON_COUNT];
@@ -112,7 +121,8 @@ struct shortcut
 
 struct pending_shortcut
 {
-    struct shortcut shortcut;
+    struct shortcut tap;
+    struct shortcut hold;
     int button;
     LONG press_id;
 };
@@ -251,23 +261,36 @@ static void foreground_exe_name(LPTSTR name, DWORD size)
     CloseHandle(process);
 }
 
-static void lookup_shortcut(int button, struct shortcut *shortcut)
+// The foreground program's own section if the file has one, otherwise [default]
+static void settings_section(LPTSTR section, DWORD size)
 {
     TCHAR exe[MAX_PATH];
-    TCHAR value[128];
+    TCHAR keys[64];
 
     foreground_exe_name(exe, MAX_PATH);
-    value[0] = TEXT('\0');
-    if (exe[0] != TEXT('\0'))
+    if (exe[0] != TEXT('\0') &&
+        GetPrivateProfileString(exe, NULL, TEXT(""), keys, ARRAYSIZE(keys), settings_path) > 0)
     {
-        GetPrivateProfileString(exe, extra_button_names[button], SETTINGS_UNSET, value, ARRAYSIZE(value), settings_path);
+        lstrcpyn(section, exe, size);
+        return;
     }
-    if (exe[0] == TEXT('\0') || _tcscmp(value, SETTINGS_UNSET) == 0)
+    lstrcpyn(section, TEXT("default"), size);
+}
+
+static void lookup_shortcuts(int button, struct shortcut *tap, struct shortcut *hold)
+{
+    TCHAR section[MAX_PATH];
+    TCHAR value[128];
+
+    settings_section(section, MAX_PATH);
+    GetPrivateProfileString(section, extra_button_names[button], TEXT(""), value, ARRAYSIZE(value), settings_path);
+    parse_shortcut(value, tap);
+    GetPrivateProfileString(section, extra_button_hold_names[button], TEXT(""), value, ARRAYSIZE(value), settings_path);
+    parse_shortcut(value, hold);
+    if (hold->key_count > 0 && hold->hold_ms == 0)
     {
-        GetPrivateProfileString(TEXT("default"), extra_button_names[button], TEXT(""), value, ARRAYSIZE(value),
-                                settings_path);
+        hold->hold_ms = DEFAULT_HOLD_MS;
     }
-    parse_shortcut(value, shortcut);
 }
 
 static void fill_key_input(INPUT *input, WORD vk, BOOL up)
@@ -299,18 +322,44 @@ static void send_shortcut(const struct shortcut *shortcut)
     SendInput(shortcut->key_count, inputs, sizeof(INPUT));
 }
 
+// TRUE while the button has not been released since this press
+static BOOL still_pressed(const struct pending_shortcut *pending)
+{
+    return extra_button_press_ids[pending->button] == pending->press_id;
+}
+
 static DWORD WINAPI shortcut_thread(LPVOID param)
 {
     struct pending_shortcut *pending = (struct pending_shortcut *)param;
 
-    if (pending->shortcut.hold_ms > 0)
+    if (pending->hold.key_count > 0)
     {
-        Sleep(pending->shortcut.hold_ms);
+        // Short press or hold: wait for the release or the hold time, whichever comes first, and send only one.
+        ULONGLONG start = GetTickCount64();
+        while (still_pressed(pending) && GetTickCount64() - start < pending->hold.hold_ms)
+        {
+            Sleep(HOLD_POLL_MS);
+        }
+        if (still_pressed(pending))
+        {
+            send_shortcut(&pending->hold);
+        }
+        else if (pending->tap.key_count > 0)
+        {
+            send_shortcut(&pending->tap);
+        }
     }
-    // A hold shortcut fires only if the button has not been released since this press
-    if (pending->shortcut.hold_ms == 0 || extra_button_press_ids[pending->button] == pending->press_id)
+    else
     {
-        send_shortcut(&pending->shortcut);
+        if (pending->tap.hold_ms > 0)
+        {
+            Sleep(pending->tap.hold_ms);
+        }
+        // A ", hold" shortcut fires only if the button has not been released since this press
+        if (pending->tap.hold_ms == 0 || still_pressed(pending))
+        {
+            send_shortcut(&pending->tap);
+        }
     }
     free(pending);
     return 0;
@@ -320,15 +369,17 @@ static DWORD WINAPI shortcut_thread(LPVOID param)
 static void start_shortcut(int button)
 {
     LONG press_id = InterlockedIncrement(&extra_button_press_ids[button]);
-    struct shortcut shortcut;
+    struct shortcut tap;
+    struct shortcut hold;
 
-    lookup_shortcut(button, &shortcut);
-    if (shortcut.key_count == 0)
+    lookup_shortcuts(button, &tap, &hold);
+    if (tap.key_count == 0 && hold.key_count == 0)
     {
         return;
     }
     struct pending_shortcut *pending = (struct pending_shortcut *)malloc(sizeof(struct pending_shortcut));
-    pending->shortcut = shortcut;
+    pending->tap = tap;
+    pending->hold = hold;
     pending->button = button;
     pending->press_id = press_id;
     HANDLE thread = CreateThread(NULL, 0, shortcut_thread, pending, 0, NULL);
