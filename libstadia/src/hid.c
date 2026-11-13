@@ -214,14 +214,26 @@ BOOL hid_reenable_device(LPTSTR path)
             .StateChange = DICS_DISABLE,
             .Scope = DICS_FLAG_GLOBAL,
             .HwProfile = 0};
-    BOOL res;
-    res = SetupDiSetClassInstallParams(device_info_set, &devinfo_data, (PSP_CLASSINSTALL_HEADER)&pc_params,
-                                       sizeof(SP_PROPCHANGE_PARAMS));
-    res = res && SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, device_info_set, &devinfo_data);
+    BOOL disabled;
+    disabled = SetupDiSetClassInstallParams(device_info_set, &devinfo_data, (PSP_CLASSINSTALL_HEADER)&pc_params,
+                                            sizeof(SP_PROPCHANGE_PARAMS));
+    disabled = disabled && SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, device_info_set, &devinfo_data);
+
+    // Always enable again, even when disabling reported a failure: a failed disable can still leave the device
+    // disabled (problem code 22), and then the controller stays unusable until it is enabled by hand.
+    BOOL enabled = FALSE;
     pc_params.StateChange = DICS_ENABLE;
-    res = res && SetupDiSetClassInstallParams(device_info_set, &devinfo_data, (PSP_CLASSINSTALL_HEADER)&pc_params,
-                                              sizeof(SP_PROPCHANGE_PARAMS));
-    res = res && SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, device_info_set, &devinfo_data);
+    for (int attempt = 0; attempt < 3 && !enabled; attempt++)
+    {
+        if (attempt > 0)
+        {
+            Sleep(200);
+        }
+        enabled = SetupDiSetClassInstallParams(device_info_set, &devinfo_data, (PSP_CLASSINSTALL_HEADER)&pc_params,
+                                               sizeof(SP_PROPCHANGE_PARAMS)) &&
+                  SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, device_info_set, &devinfo_data);
+    }
+    BOOL res = disabled && enabled;
 
     free(inst_id);
     SetupDiDestroyDeviceInfoList(device_info_set);
@@ -302,15 +314,18 @@ struct hid_device *hid_open_device(LPTSTR path, BOOL access_rw, BOOL shared)
 
     HidD_FreePreparsedData(pp_data);
 
+    // Manual-reset events: with auto-reset events the read loop picked up only one report every ~100 ms, so
+    // queued reports played back in slow motion (one stick flick became seconds of input).
     memset(&dev->input_ol, 0, sizeof(OVERLAPPED));
-    dev->input_ol.hEvent = CreateEvent(&security, FALSE, FALSE, NULL);
+    dev->input_ol.hEvent = CreateEvent(&security, TRUE, FALSE, NULL);
 
     memset(&dev->output_ol, 0, sizeof(OVERLAPPED));
-    dev->output_ol.hEvent = CreateEvent(&security, FALSE, FALSE, NULL);
+    dev->output_ol.hEvent = CreateEvent(&security, TRUE, FALSE, NULL);
 
     return dev;
 }
 
+// Returns the report size, 0 when no report arrived within the timeout (the read stays pending), or -1 on error.
 INT hid_get_input_report(struct hid_device *device, DWORD timeout)
 {
     DWORD bytes_read = 0;
@@ -318,43 +333,35 @@ INT hid_get_input_report(struct hid_device *device, DWORD timeout)
 
     if (!device->read_pending)
     {
-        device->read_pending = TRUE;
         memset(device->input_buffer, 0, device->input_report_size);
         ResetEvent(ev);
-        if (!ReadFile(device->handle, device->input_buffer, device->input_report_size, &bytes_read, &device->input_ol))
+        if (ReadFile(device->handle, device->input_buffer, device->input_report_size, &bytes_read, &device->input_ol))
         {
-            if (GetLastError() != ERROR_IO_PENDING)
-            {
-                CancelIo(device->handle);
-                device->read_pending = FALSE;
-                return -1;
-            }
+            // A report was already queued: the read completed at once.
+            return bytes_read;
         }
+        if (GetLastError() != ERROR_IO_PENDING)
+        {
+            return -1;
+        }
+        device->read_pending = TRUE;
     }
 
-    if (timeout >= 0)
+    if (WaitForSingleObject(ev, timeout) != WAIT_OBJECT_0)
     {
-        if (WaitForSingleObject(ev, timeout) != WAIT_OBJECT_0)
-        {
-            /* There was no data this time. Return zero bytes available,
-			   but leave the Overlapped I/O running. */
-            return 0;
-        }
-    }
-
-    /* Either WaitForSingleObject() told us that ReadFile has completed, or
-	   we are in non-blocking mode. Get the number of bytes read. The actual
-	   data has been copied to the data[] array which was passed to ReadFile(). */
-    if (GetOverlappedResult(device->handle, &device->input_ol, &bytes_read, TRUE))
-    {
-        device->read_pending = FALSE;
-        return bytes_read;
+        // No report yet; leave the read pending for the next call.
+        return 0;
     }
 
     device->read_pending = FALSE;
-    return -1;
+    if (!GetOverlappedResult(device->handle, &device->input_ol, &bytes_read, FALSE))
+    {
+        return -1;
+    }
+    return bytes_read;
 }
 
+// Returns the bytes written, 0 when the write is still pending after the timeout, or -1 on error.
 INT hid_send_output_report(struct hid_device *device, const void *data, size_t length, DWORD timeout)
 {
     DWORD bytes_written = 0;
@@ -362,44 +369,33 @@ INT hid_send_output_report(struct hid_device *device, const void *data, size_t l
 
     if (!device->write_pending)
     {
-        device->write_pending = TRUE;
-
         memset(device->output_buffer, 0x0, device->output_report_size);
         memmove(device->output_buffer, data, length > device->output_report_size ? device->output_report_size : length);
 
         ResetEvent(ev);
-        if (!WriteFile(device->handle, device->output_buffer, device->output_report_size, &bytes_written, &device->output_ol))
+        if (WriteFile(device->handle, device->output_buffer, device->output_report_size, &bytes_written, &device->output_ol))
         {
-            if (GetLastError() != ERROR_IO_PENDING)
-            {
-                CancelIo(device->handle);
-                device->write_pending = FALSE;
-                return -1;
-            }
+            return bytes_written;
         }
+        if (GetLastError() != ERROR_IO_PENDING)
+        {
+            return -1;
+        }
+        device->write_pending = TRUE;
     }
 
-    if (timeout >= 0)
+    if (WaitForSingleObject(ev, timeout) != WAIT_OBJECT_0)
     {
-        if (WaitForSingleObject(ev, timeout) != WAIT_OBJECT_0)
-        {
-            /* There was no data this time. Return zero bytes written,
-            but leave the Overlapped I/O running. */
-            return 0;
-        }
-    }
-
-    /* Either WaitForSingleObject() told us that WriteFile has completed, or
-    we are in non-blocking mode. Get the number of bytes written. The actual
-    data was passed to WriteFile(). */
-    if (GetOverlappedResult(device->handle, &device->output_ol, &bytes_written, TRUE))
-    {
-        device->write_pending = FALSE;
-        return bytes_written;
+        // Still writing; the next call waits for this write instead of starting another.
+        return 0;
     }
 
     device->write_pending = FALSE;
-    return -1;
+    if (!GetOverlappedResult(device->handle, &device->output_ol, &bytes_written, FALSE))
+    {
+        return -1;
+    }
+    return bytes_written;
 }
 
 INT hid_send_feature_report(struct hid_device *device, const void *data, size_t length)
@@ -423,6 +419,20 @@ INT hid_send_feature_report(struct hid_device *device, const void *data, size_t 
 void hid_close_device(struct hid_device *device)
 {
     CancelIoEx(device->handle, NULL);
+
+    // Wait until cancelled reads and writes have finished, so they do not write into freed buffers.
+    DWORD transferred;
+    if (device->read_pending)
+    {
+        GetOverlappedResult(device->handle, &device->input_ol, &transferred, TRUE);
+        device->read_pending = FALSE;
+    }
+    if (device->write_pending)
+    {
+        GetOverlappedResult(device->handle, &device->output_ol, &transferred, TRUE);
+        device->write_pending = FALSE;
+    }
+
     CloseHandle(device->input_ol.hEvent);
     CloseHandle(device->output_ol.hEvent);
     CloseHandle(device->handle);

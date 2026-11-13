@@ -41,6 +41,7 @@ int tray_loop(BOOLEAN blocking);
 void tray_update(struct tray *tray);
 void tray_exit();
 void tray_register_device_notification(GUID filter, void (*cb)(UINT, LPTSTR));
+void tray_request_device_refresh();
 void tray_show_notification(UINT type, LPTSTR title, LPTSTR text);
 
 #endif /* TRAY_H */

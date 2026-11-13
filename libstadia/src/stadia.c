@@ -42,12 +42,25 @@ static DWORD WINAPI _stadia_input_thread(LPVOID lparam)
 
     while (controller->active)
     {
-        while ((bytes_read = hid_get_input_report(controller->device, STADIA_READ_TIMEOUT)) == 0)
+        while (controller->active && (bytes_read = hid_get_input_report(controller->device, STADIA_READ_TIMEOUT)) == 0)
             ;
+
+        if (!controller->active)
+        {
+            // Stopped by stadia_controller_destroy.
+            return 0;
+        }
 
         if (bytes_read < 0)
         {
-            break;
+            // The controller is gone or its handle broke. Stop the output thread and let the owner clean up.
+            controller->active = FALSE;
+            SetEvent(controller->stopping_event);
+            if (stadia_stop_callback != NULL)
+            {
+                stadia_stop_callback(controller);
+            }
+            return 0;
         }
 
         // check packet header
@@ -90,8 +103,6 @@ static DWORD WINAPI _stadia_input_thread(LPVOID lparam)
 
         stadia_update_callback(controller, &controller->state);
     }
-
-    stadia_controller_destroy(controller);
 
     return 0;
 }
@@ -183,15 +194,12 @@ void stadia_controller_set_vibration(struct stadia_controller *controller, BYTE 
 
 void stadia_controller_destroy(struct stadia_controller *controller)
 {
-    CancelIoEx(controller->device->handle, &controller->device->input_ol);
-
     controller->active = FALSE;
     SetEvent(controller->stopping_event);
+    CancelIoEx(controller->device->handle, NULL);
 
     INT thread_count = 0;
     HANDLE threads[2];
-
-    WaitForMultipleObjects(2, threads, TRUE, INFINITE);
 
     if (controller->input_thread != NULL)
     {
@@ -203,15 +211,24 @@ void stadia_controller_destroy(struct stadia_controller *controller)
         threads[thread_count++] = controller->output_thread;
     }
 
-    CloseHandle(controller->stopping_event);
-    CloseHandle(controller->output_event);
+    // Threads are created suspended; a failed stadia_controller_create may never have resumed them.
+    for (INT i = 0; i < thread_count; i++)
+    {
+        ResumeThread(threads[i]);
+    }
+
+    if (thread_count > 0)
+    {
+        WaitForMultipleObjects(thread_count, threads, TRUE, INFINITE);
+    }
 
     for (INT i = 0; i < thread_count; i++)
     {
         CloseHandle(threads[i]);
     }
 
-    stadia_destroy_callback(controller);
+    CloseHandle(controller->stopping_event);
+    CloseHandle(controller->output_event);
 
     free(controller);
 }

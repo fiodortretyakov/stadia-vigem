@@ -137,9 +137,17 @@ static HMENU _tray_menu(struct tray_menu *m, UINT *id)
 
 int tray_init(struct tray *tray)
 {
+    // One copy only: a second copy would fight the first over the controller and add a second virtual pad.
+    // A copy running as administrator makes the mutex inaccessible (NULL), a normal copy makes it exist.
     hmutex = CreateMutex(NULL, TRUE, WC_TRAY_MUTEX_NAME);
     if (hmutex == NULL)
     {
+        return -1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        CloseHandle(hmutex);
+        hmutex = NULL;
         return -1;
     }
 
@@ -248,6 +256,15 @@ void tray_register_device_notification(GUID filter, void (*cb)(UINT, LPTSTR))
     if (hdevntf != NULL)
     {
         devntf_cb = cb;
+    }
+}
+
+void tray_request_device_refresh()
+{
+    // Safe from any thread: the main thread runs the device-change callback when it handles the message.
+    if (window_handle != NULL)
+    {
+        PostMessage(window_handle, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED, 0);
     }
 }
 

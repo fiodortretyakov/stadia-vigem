@@ -58,7 +58,7 @@ struct stadia_controller
     SRWLOCK state_lock;
     struct stadia_state state;
 
-    BOOL active;
+    volatile BOOL active;
     HANDLE stopping_event;
     HANDLE output_event;
 
@@ -71,10 +71,14 @@ struct stadia_controller
 };
 
 void (*stadia_update_callback)(struct stadia_controller *, struct stadia_state *);
-void (*stadia_destroy_callback)(struct stadia_controller *);
+// Called on the controller's input thread when reading fails, for example because the controller disconnected.
+// It must not destroy the controller; the owner calls stadia_controller_destroy from another thread.
+void (*stadia_stop_callback)(struct stadia_controller *);
 
 struct stadia_controller *stadia_controller_create(struct hid_device *device);
 void stadia_controller_set_vibration(struct stadia_controller *controller, BYTE small_motor, BYTE big_motor);
+// Stops both controller threads, waits for them and frees the controller. The HID device stays open.
+// Never call it from a controller thread or a stadia callback.
 void stadia_controller_destroy(struct stadia_controller *controller);
 
 #endif // STADIA_H

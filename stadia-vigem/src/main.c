@@ -454,44 +454,27 @@ static BOOL add_device(LPTSTR path)
     return TRUE;
 }
 
-static BOOL remove_device(struct stadia_controller *controller)
+// Frees a device that is no longer in active_devices. Runs on the main thread only.
+static void release_device(struct active_device *device)
 {
-    BOOL removed = FALSE;
-
-    AcquireSRWLockExclusive(&active_devices_lock);
-
-    for (int i = 0; i < active_device_count; i++)
+    if (vigem_connected)
     {
-        if (active_devices[i]->controller == controller)
-        {
-            hid_close_device(active_devices[i]->src_device);
-            hid_free_device(active_devices[i]->src_device);
-
-            if (vigem_connected)
-            {
-                vigem_target_x360_unregister_notification(active_devices[i]->tgt_device);
-                vigem_target_remove(vigem_client, active_devices[i]->tgt_device);
-                vigem_target_free(active_devices[i]->tgt_device);
-            }
-
-            free(active_devices[i]);
-
-            if (i < active_device_count - 1)
-            {
-                memmove(&active_devices[i], &active_devices[i + 1],
-                        sizeof(struct active_device *) * (active_device_count - i - 1));
-            }
-
-            active_device_count--;
-            removed = TRUE;
-
-            break;
-        }
+        vigem_target_x360_unregister_notification(device->tgt_device);
     }
 
-    ReleaseSRWLockExclusive(&active_devices_lock);
+    // Joins the controller's input and output threads, so no stadia callback uses the device after this.
+    stadia_controller_destroy(device->controller);
 
-    return removed;
+    hid_close_device(device->src_device);
+    hid_free_device(device->src_device);
+
+    if (vigem_connected)
+    {
+        vigem_target_remove(vigem_client, device->tgt_device);
+        vigem_target_free(device->tgt_device);
+    }
+
+    free(device);
 }
 
 static void refresh_devices()
@@ -501,10 +484,14 @@ static void refresh_devices()
     struct hid_device_info *cur;
     BOOL found = FALSE;
 
-    // remove missing devices
-    AcquireSRWLockShared(&active_devices_lock);
+    // Take out devices that are gone or whose controller stopped (for example after a disconnect),
+    // then release them outside the lock: releasing waits for the controller threads.
+    struct active_device *stale_devices[MAX_ACTIVE_DEVICE_COUNT];
+    int stale_count = 0;
 
-    for (int i = 0; i < active_device_count; i++)
+    AcquireSRWLockExclusive(&active_devices_lock);
+
+    for (int i = 0; i < active_device_count;)
     {
         found = FALSE;
         cur = device_info;
@@ -520,13 +507,33 @@ static void refresh_devices()
             cur = cur->next;
         }
 
-        if (!found)
+        if (found && active_devices[i]->controller->active)
         {
-            stadia_controller_destroy(active_devices[i]->controller);
+            i++;
+            continue;
         }
+
+        stale_devices[stale_count++] = active_devices[i];
+        if (i < active_device_count - 1)
+        {
+            memmove(&active_devices[i], &active_devices[i + 1],
+                    sizeof(struct active_device *) * (active_device_count - i - 1));
+        }
+        active_device_count--;
     }
 
-    ReleaseSRWLockShared(&active_devices_lock);
+    ReleaseSRWLockExclusive(&active_devices_lock);
+
+    for (int i = 0; i < stale_count; i++)
+    {
+        release_device(stale_devices[i]);
+    }
+
+    if (stale_count > 0)
+    {
+        rebuild_tray_menu();
+        tray_update(&tray);
+    }
 
     // add new devices
     cur = device_info;
@@ -627,21 +634,32 @@ static void stadia_controller_update_cb(struct stadia_controller *controller, st
     }
 }
 
+// Runs on the controller's input thread: only ask the main thread to refresh, which releases the stopped device.
 static void stadia_controller_stop_cb(struct stadia_controller *controller)
 {
-    LPTSTR ntf_text;
-    if (remove_device(controller))
-    {
-        rebuild_tray_menu();
-        tray_update(&tray);
-    }
+    (void)controller;
+    tray_request_device_refresh();
 }
 
+// Runs on a ViGEm thread that can still fire after its device was released, so look the device up by target
+// instead of trusting user_data, and hold the list lock while using it.
 static void CALLBACK x360_notification_cb(PVIGEM_CLIENT client, PVIGEM_TARGET target, UCHAR large_motor,
                                           UCHAR small_motor, UCHAR led_number, LPVOID user_data)
 {
-    struct active_device *active_device = (struct active_device *)user_data;
-    stadia_controller_set_vibration(active_device->controller, small_motor, large_motor);
+    (void)client;
+    (void)led_number;
+    (void)user_data;
+
+    AcquireSRWLockShared(&active_devices_lock);
+    for (int i = 0; i < active_device_count; i++)
+    {
+        if (active_devices[i]->tgt_device == target)
+        {
+            stadia_controller_set_vibration(active_devices[i]->controller, small_motor, large_motor);
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&active_devices_lock);
 }
 
 static void refresh_cb(struct tray_menu *item)
@@ -690,10 +708,11 @@ INT main()
     }
 
     stadia_update_callback = stadia_controller_update_cb;
-    stadia_destroy_callback = stadia_controller_stop_cb;
+    stadia_stop_callback = stadia_controller_stop_cb;
 
-    refresh_devices();
+    // Register first, so a controller that connects during the first scan is not missed.
     tray_register_device_notification(hid_get_class(), device_change_cb);
+    refresh_devices();
 
     while (tray_loop(TRUE) == 0)
     {
@@ -701,20 +720,15 @@ INT main()
     }
 
     AcquireSRWLockExclusive(&active_devices_lock);
-    for (INT i = 0; i < active_device_count; i++)
-    {
-        hid_close_device(active_devices[i]->src_device);
-        hid_free_device(active_devices[i]->src_device);
-        if (vigem_connected)
-        {
-            vigem_target_x360_unregister_notification(active_devices[i]->tgt_device);
-            vigem_target_remove(vigem_client, active_devices[i]->tgt_device);
-            vigem_target_free(active_devices[i]->tgt_device);
-        }
-        free(active_devices[i]);
-    }
+    INT count = active_device_count;
+    struct active_device *remaining[MAX_ACTIVE_DEVICE_COUNT];
+    memcpy(remaining, active_devices, sizeof(struct active_device *) * count);
     active_device_count = 0;
     ReleaseSRWLockExclusive(&active_devices_lock);
+    for (INT i = 0; i < count; i++)
+    {
+        release_device(remaining[i]);
+    }
     if (vigem_connected)
     {
         vigem_disconnect(vigem_client);
