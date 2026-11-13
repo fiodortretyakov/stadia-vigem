@@ -13,6 +13,7 @@
 #include "tray.h"
 #include "hid.h"
 #include "stadia.h"
+#include "screenshot.h"
 
 #ifndef _DEBUG
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
@@ -76,7 +77,7 @@ SHORT FORCEINLINE _map_byte_to_short(BYTE value, BOOL inverted)
  * They come from stadia-vigem.ini next to the program, read on every press, so edits apply at once:
  *
  *   [default]
- *   Capture=Win+PrintScreen
+ *   Capture=Screenshot
  *   CaptureHold=F9
  *
  *   [Prey.exe]
@@ -89,6 +90,8 @@ SHORT FORCEINLINE _map_byte_to_short(BYTE value, BOOL inverted)
  * <Button>Hold sets a second shortcut for holding the button (1 second unless it has its own ", hold"). With it, the
  * plain shortcut is sent on a short press, at release, and the hold shortcut when the button is still down after
  * the hold time; only one of the two is sent.
+ * The value Screenshot saves a PNG of the screen to the Screenshots folder instead of sending keys; it works in games
+ * that block the Windows key, where Win+PrintScreen does nothing.
  */
 #define SETTINGS_FILE_NAME TEXT("stadia-vigem.ini")
 #define MAX_SHORTCUT_KEYS 4
@@ -116,8 +119,14 @@ struct shortcut
 {
     WORD keys[MAX_SHORTCUT_KEYS];
     int key_count;
+    BOOL screenshot; // the value Screenshot: save one instead of sending keys
     DWORD hold_ms;
 };
+
+static BOOL shortcut_is_set(const struct shortcut *shortcut)
+{
+    return shortcut->key_count > 0 || shortcut->screenshot;
+}
 
 struct pending_shortcut
 {
@@ -222,6 +231,11 @@ static BOOL parse_shortcut(LPTSTR text, struct shortcut *shortcut)
     }
 
     trim(text);
+    if (_tcsicmp(text, TEXT("Screenshot")) == 0)
+    {
+        shortcut->screenshot = TRUE;
+        return TRUE;
+    }
     LPTSTR context = NULL;
     for (LPTSTR part = _tcstok_s(text, TEXT("+"), &context); part != NULL; part = _tcstok_s(NULL, TEXT("+"), &context))
     {
@@ -287,7 +301,7 @@ static void lookup_shortcuts(int button, struct shortcut *tap, struct shortcut *
     parse_shortcut(value, tap);
     GetPrivateProfileString(section, extra_button_hold_names[button], TEXT(""), value, ARRAYSIZE(value), settings_path);
     parse_shortcut(value, hold);
-    if (hold->key_count > 0 && hold->hold_ms == 0)
+    if (shortcut_is_set(hold) && hold->hold_ms == 0)
     {
         hold->hold_ms = DEFAULT_HOLD_MS;
     }
@@ -308,6 +322,12 @@ static void fill_key_input(INPUT *input, WORD vk, BOOL up)
 static void send_shortcut(const struct shortcut *shortcut)
 {
     INPUT inputs[MAX_SHORTCUT_KEYS] = {0};
+
+    if (shortcut->screenshot)
+    {
+        take_screenshot();
+        return;
+    }
 
     for (int i = 0; i < shortcut->key_count; i++)
     {
@@ -332,7 +352,7 @@ static DWORD WINAPI shortcut_thread(LPVOID param)
 {
     struct pending_shortcut *pending = (struct pending_shortcut *)param;
 
-    if (pending->hold.key_count > 0)
+    if (shortcut_is_set(&pending->hold))
     {
         // Short press or hold: wait for the release or the hold time, whichever comes first, and send only one.
         ULONGLONG start = GetTickCount64();
@@ -344,7 +364,7 @@ static DWORD WINAPI shortcut_thread(LPVOID param)
         {
             send_shortcut(&pending->hold);
         }
-        else if (pending->tap.key_count > 0)
+        else if (shortcut_is_set(&pending->tap))
         {
             send_shortcut(&pending->tap);
         }
@@ -373,7 +393,7 @@ static void start_shortcut(int button)
     struct shortcut hold;
 
     lookup_shortcuts(button, &tap, &hold);
-    if (tap.key_count == 0 && hold.key_count == 0)
+    if (!shortcut_is_set(&tap) && !shortcut_is_set(&hold))
     {
         return;
     }
